@@ -1,0 +1,3 @@
+# No secrets need to be entered for Cloudflare deployment.
+# The deployment script generates APP_MASTER_KEY and SETUP_TOKEN automatically.
+# For local development, run: pnpm run dev:setup

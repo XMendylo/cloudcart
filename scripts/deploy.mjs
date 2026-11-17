@@ -1,0 +1,415 @@
+#!/usr/bin/env node
+/**
+ * CloudCart deployment CLI.
+ *
+ * Idempotent: re-running reuses the Worker, D1 database and
+ * existing secrets instead of creating new resources or overwriting data.
+ *
+ * Usage:
+ *   node scripts/deploy.mjs
+ *   node scripts/deploy.mjs --name cloudcart-fashion
+ *   node scripts/deploy.mjs --check          # non-mutating environment check
+ *   node scripts/deploy.mjs --skip-build
+ *   node scripts/deploy.mjs --no-open        # do not open the browser
+ */
+import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import readline from "node:readline/promises";
+
+const ROOT = path.resolve(import.meta.dirname, "..");
+const CONFIG_PATH = path.join(ROOT, "wrangler.jsonc");
+const STATE_DIR = path.join(ROOT, ".cloudcart");
+const STATE_PATH = path.join(STATE_DIR, "deploy.json");
+const args = process.argv.slice(2);
+
+const flags = new Set(args.filter((arg) => arg.startsWith("--")));
+const nameArgIndex = args.indexOf("--name");
+const nameArg = nameArgIndex !== -1 ? args[nameArgIndex + 1] : null;
+
+function log(message) {
+  process.stdout.write(`\n${message}\n`);
+}
+
+function step(message) {
+  process.stdout.write(`\n▸ ${message}\n`);
+}
+
+function fail(message) {
+  console.error(`\n✖ ${message}\n`);
+  process.exit(1);
+}
+
+function run(command, commandArgs, options = {}) {
+  const result = spawnSync(command, commandArgs, {
+    cwd: ROOT,
+    encoding: "utf8",
+    shell: process.platform === "win32",
+    input: options.input,
+    stdio: options.capture ? ["pipe", "pipe", "pipe"] : options.input ? ["pipe", "inherit", "inherit"] : "inherit",
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  if (options.capture) {
+    return {
+      status: result.status ?? 1,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+    };
+  }
+  if (result.status !== 0) {
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (options.allowFailure) return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    fail(options.errorMessage ?? `Command failed: ${command} ${commandArgs.join(" ")}`);
+  }
+  return { status: 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function wrangler(wranglerArgs, options = {}) {
+  return run("npx", ["wrangler", ...wranglerArgs], options);
+}
+
+function stripJsonComments(source) {
+  let output = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (inString) {
+      output += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      output += char;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") index += 1;
+      output += "\n";
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) index += 1;
+      index += 1;
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+function readConfig() {
+  const raw = fs.readFileSync(CONFIG_PATH, "utf8");
+  return JSON.parse(stripJsonComments(raw));
+}
+
+function writeConfig(config) {
+  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function loadState() {
+  if (!fs.existsSync(STATE_PATH)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveState(state) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+}
+
+function sanitizeName(value) {
+  const cleaned = String(value || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 52);
+  return cleaned || "cloudcart";
+}
+
+function randomSecret(bytes) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+/**
+ * A local interactive deployment can open the store in the user's browser.
+ * Deploy to Cloudflare runs this script inside Workers Builds, where there is
+ * no user browser to open; those deployments rely on the build log and the
+ * dashboard's Visit link instead.
+ */
+function shouldOpenBrowser() {
+  if (flags.has("--no-open") || process.env.CLOUDCART_NO_OPEN) return false;
+  if (process.env.CI || process.env.WORKERS_CI || process.env.GITHUB_ACTIONS) return false;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return false;
+  if (process.platform === "win32" || process.platform === "darwin") return true;
+  return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+}
+
+function openInBrowser(url) {
+  const child = process.platform === "win32"
+    ? spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true })
+    : process.platform === "darwin"
+      ? spawn("open", [url], { stdio: "ignore", detached: true })
+      : spawn("xdg-open", [url], { stdio: "ignore", detached: true });
+  child.on("error", () => {
+    // A missing browser launcher must never fail an otherwise successful deploy.
+  });
+  child.unref();
+  return true;
+}
+
+async function askStoreName(defaultName) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return defaultName;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`Store / Worker name [${defaultName}]: `);
+    return answer.trim() || defaultName;
+  } finally {
+    rl.close();
+  }
+}
+
+async function main() {
+  log("CloudCart → Cloudflare Workers deployment");
+
+  step("Checking Node.js");
+  const major = Number(process.versions.node.split(".")[0]);
+  if (!Number.isFinite(major) || major < 20) fail("Node.js 20 or newer is required.");
+  console.log(`  Node ${process.versions.node}`);
+
+  step("Checking Wrangler");
+  const version = run("npx", ["wrangler", "--version"], { capture: true });
+  if (version.status !== 0) fail("Wrangler is not available. Run `pnpm install` first.");
+  console.log(`  ${version.stdout.trim().split("\n")[0]}`);
+
+  step("Checking Cloudflare authentication");
+  const whoami = wrangler(["whoami"], { capture: true });
+  if (whoami.status !== 0 || /not authenticated|not logged in/i.test(whoami.stdout + whoami.stderr)) {
+    fail("You are not signed in to Cloudflare. Run `npx wrangler login`, then re-run this script.");
+  }
+  console.log(whoami.stdout.trim().split("\n").map((line) => `  ${line}`).join("\n"));
+
+  const state = loadState();
+  const config = readConfig();
+  const defaultName = state.workerName || config.name || "cloudcart";
+  const requested = nameArg || process.env.CLOUDCART_NAME || state.workerName;
+  const workerName = sanitizeName(requested || (flags.has("--check") ? defaultName : await askStoreName(defaultName)));
+  if (workerName !== (config.name || "")) {
+    log(`  Worker name: ${config.name} → ${workerName}`);
+  } else {
+    log(`  Worker name: ${workerName}`);
+  }
+  let dbName = state.d1Name || workerName;
+
+  if (flags.has("--check")) {
+    log("Environment check passed. No resources were changed.");
+    return;
+  }
+
+  step("Finding or creating the D1 database");
+  let dbId = null;
+  // The Deploy to Cloudflare button provisions D1 from wrangler.jsonc and
+  // writes a real database_id back before this script runs. Prefer that
+  // binding when it belongs to the current account; otherwise fall back to
+  // the CloudCart-managed database name. This avoids creating a second
+  // database when a one-click deployment picks a different name.
+  const configuredDatabase = Array.isArray(config.d1_databases) ? config.d1_databases[0] : null;
+  const d1List = wrangler(["d1", "list", "--json"], { capture: true, allowFailure: true });
+  if (d1List.status === 0) {
+    try {
+      const databases = JSON.parse(d1List.stdout);
+      if (configuredDatabase?.database_id) {
+        const configured = databases.find(
+          (database) => (database.uuid || database.id) === configuredDatabase.database_id,
+        );
+        if (configured) {
+          dbId = configured.uuid || configured.id || null;
+          dbName = configured.name || configuredDatabase.database_name || dbName;
+        }
+      }
+      if (!dbId) {
+        const found = databases.find((database) => database.name === dbName);
+        if (found) dbId = found.uuid || found.id || null;
+      }
+    } catch {
+      // fall through to text parsing
+    }
+  }
+  if (!dbId) {
+    const text = wrangler(["d1", "list"], { capture: true, allowFailure: true }).stdout;
+    const match = text.split("\n").find((line) => line.includes(dbName));
+    if (match) {
+      const idMatch = match.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (idMatch) dbId = idMatch[0];
+    }
+  }
+  if (dbId) {
+    console.log(`  Using existing database ${dbName} (${dbId})`);
+  } else {
+    console.log(`  Creating database ${dbName}…`);
+    wrangler(["d1", "create", dbName]);
+    const refreshed = wrangler(["d1", "list", "--json"], { capture: true });
+    const databases = JSON.parse(refreshed.stdout);
+    const found = databases.find((database) => database.name === dbName);
+    dbId = found?.uuid || found?.id;
+    if (!dbId) fail("The database was created but its id could not be read. Check `npx wrangler d1 list`.");
+    console.log(`  Created ${dbName} (${dbId})`);
+  }
+
+  step("Updating wrangler.jsonc");
+  config.name = workerName;
+  config.d1_databases = [{
+    binding: "DB",
+    database_name: dbName,
+    database_id: dbId,
+    migrations_dir: "migrations",
+  }];
+  delete config.r2_buckets;
+  writeConfig(config);
+  console.log("  Worker and D1 bindings updated. R2 is optional and was not provisioned.");
+
+  step("Building the storefront and admin UI");
+  if (flags.has("--skip-build")) {
+    console.log("  Skipped (--skip-build).");
+  } else {
+    run("pnpm", ["run", "build"]);
+  }
+
+  step("Applying database migrations (remote)");
+  // Reference the binding name rather than the database name. Cloudflare's
+  // one-click deployment may let the user rename the database, while the
+  // binding written above is always DB.
+  const migration = wrangler(["d1", "migrations", "apply", "DB", "--remote"], { capture: true, input: "y\n" });
+  if (migration.status !== 0) {
+    process.stderr.write(migration.stdout);
+    process.stderr.write(migration.stderr);
+    fail("Database migrations failed. No Worker was deployed.");
+  }
+  console.log(migration.stdout.trim().split("\n").map((line) => `  ${line}`).join("\n"));
+
+  step("Deploying the Worker");
+  const deploy = wrangler(["deploy"], { capture: true });
+  if (deploy.status !== 0) {
+    process.stderr.write(deploy.stdout);
+    process.stderr.write(deploy.stderr);
+    fail("Worker deployment failed.");
+  }
+  console.log(deploy.stdout.trim().split("\n").map((line) => `  ${line}`).join("\n"));
+  const urlMatch = deploy.stdout.match(/https:\/\/[^\s"'<>]+\.workers\.dev/);
+  const workerUrl = urlMatch ? urlMatch[0] : `https://${workerName}.workers.dev`;
+
+  // Prefer the database over an HTTP probe: workers.dev can be blocked or
+  // intercepted on some networks, which previously made an installed store
+  // look uninstalled and caused an unnecessary SETUP_TOKEN rotation.
+  let installed = null;
+  const installState = wrangler(
+    ["d1", "execute", "DB", "--remote", "--json", "--command=\"SELECT installed_at FROM installation_state WHERE id = 1\""],
+    { capture: true, allowFailure: true },
+  );
+  if (installState.status === 0) {
+    try {
+      const parsed = JSON.parse(installState.stdout);
+      const rows = Array.isArray(parsed)
+        ? parsed.flatMap((entry) => (Array.isArray(entry?.results) ? entry.results : []))
+        : [];
+      installed = rows.some((row) => Boolean(row?.installed_at));
+    } catch {
+      installed = null;
+    }
+  }
+  if (installed === null) {
+    try {
+      const statusResponse = await fetch(`${workerUrl}/api/setup/status`, { redirect: "error" });
+      if (statusResponse.ok) {
+        const status = await statusResponse.json();
+        installed = status.installed === true;
+      }
+    } catch {
+      // Keep null: reuse any existing setup token instead of rotating it when
+      // the installation state cannot be confirmed.
+    }
+  }
+
+  step("Configuring Worker secrets");
+  const secretList = wrangler(["secret", "list", "--name", workerName], { capture: true, allowFailure: true });
+  const existingSecrets = new Set(
+    (secretList.stdout.match(/[A-Z][A-Z0-9_]+/g) ?? []),
+  );
+  let masterKey = state.appMasterKey || null;
+  if (existingSecrets.has("APP_MASTER_KEY")) {
+    console.log("  APP_MASTER_KEY already exists — keeping it (rotating would invalidate sessions and encrypted payment keys).");
+  } else {
+    masterKey = masterKey || randomSecret(32);
+    wrangler(["secret", "put", "APP_MASTER_KEY", "--name", workerName], { input: `${masterKey}\n` });
+    console.log("  APP_MASTER_KEY generated and configured automatically.");
+  }
+
+  if (installed === null) {
+    console.log("  Could not confirm whether the store is installed — keeping any existing setup token.");
+  }
+  let setupToken = state.setupToken || null;
+  if (installed) {
+    setupToken = null;
+    console.log("  Store is already installed — no setup token is needed.");
+  } else if (setupToken && existingSecrets.has("SETUP_TOKEN")) {
+    console.log("  Reusing the existing one-time setup token.");
+  } else {
+    // Workers Builds uses a fresh checkout for each build, so its local state
+    // file is not persistent. Before first installation, refresh the token and
+    // print the new private setup link in the build log.
+    setupToken = randomSecret(32);
+    wrangler(["secret", "put", "SETUP_TOKEN", "--name", workerName], { input: `${setupToken}\n` });
+    console.log("  One-time setup token generated and configured automatically.");
+  }
+
+  saveState({
+    workerName,
+    d1Name: dbName,
+    d1Id: dbId,
+    workerUrl,
+    appMasterKey: masterKey,
+    setupToken,
+    deployedAt: new Date().toISOString(),
+  });
+
+  const setupLink = setupToken
+    ? `${workerUrl}/setup?token=${encodeURIComponent(setupToken)}`
+    : null;
+  const browserUrl = setupLink ?? `${workerUrl}/admin`;
+
+  log("============================================================");
+  console.log("  YOUR STORE IS READY / 商城已部署");
+  console.log("");
+  console.log(`  Website / 网站:  ${workerUrl}`);
+  console.log(`  Admin / 后台:    ${workerUrl}/admin`);
+  if (setupLink) {
+    console.log("");
+    console.log("  Finish setup / 打开下面链接创建管理员（一次性，请勿分享）:");
+    console.log(`  ${setupLink}`);
+  }
+  log("============================================================");
+  if (setupLink) {
+    console.log("The one-time setup link stops working permanently after the first administrator is created.");
+  }
+  console.log(`Deployment state (including generated secrets) was saved to ${path.relative(ROOT, STATE_PATH)} — keep it private.`);
+
+  if (shouldOpenBrowser()) {
+    try {
+      openInBrowser(browserUrl);
+      console.log("Opened the store in your browser. If it did not open, copy the Website link above.");
+    } catch {
+      console.log("Could not open a browser automatically — copy the Website link above.");
+    }
+  } else {
+    console.log("Cloudflare Workers Builds runs remotely and cannot open your browser. Use the Website link above, or Dashboard → Workers & Pages → your project → Visit.");
+  }
+  log("Done.");
+}
+
+main().catch((error) => fail(error instanceof Error ? error.message : String(error)));
